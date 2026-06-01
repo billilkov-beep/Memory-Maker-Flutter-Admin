@@ -2,46 +2,104 @@ workflows:
   android-apk:
     name: Memory Maker Admin Android APK
     max_build_duration: 60
+
     environment:
       flutter: stable
       groups:
         - memorymaker_env
+
     scripts:
+      - name: Verify Supabase environment variables
+        script: |
+          echo "Checking environment variables..."
+
+          if [ -z "$SUPABASE_URL" ]; then
+            echo "ERROR: SUPABASE_URL is missing"
+            exit 1
+          fi
+
+          if [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "ERROR: SUPABASE_ANON_KEY is missing"
+            exit 1
+          fi
+
+          if [ -z "$APP_URL" ]; then
+            echo "APP_URL is missing, setting default"
+            export APP_URL="https://memorymaker.com"
+          fi
+
+          if [ -z "$DEMO_MODE" ]; then
+            echo "DEMO_MODE is missing, setting false"
+            export DEMO_MODE="false"
+          fi
+
+          echo "SUPABASE_URL length: ${#SUPABASE_URL}"
+          echo "SUPABASE_ANON_KEY length: ${#SUPABASE_ANON_KEY}"
+          echo "APP_URL: $APP_URL"
+          echo "DEMO_MODE: $DEMO_MODE"
+
       - name: Create environment file
         script: |
-          cat > .env <<EOF_ENV
-          SUPABASE_URL=${SUPABASE_URL}
-          SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
-          APP_URL=${APP_URL}
-          DEMO_MODE=${DEMO_MODE}
-          EOF_ENV
-      - name: Recreate Android project
+          cat > .env <<EOF2
+          SUPABASE_URL=$SUPABASE_URL
+          SUPABASE_ANON_KEY=$SUPABASE_ANON_KEY
+          APP_URL=$APP_URL
+          DEMO_MODE=$DEMO_MODE
+          EOF2
+
+          echo ".env file created"
+          cat .env | sed 's/SUPABASE_ANON_KEY=.*/SUPABASE_ANON_KEY=HIDDEN/'
+
+      - name: Create Android project
         script: |
           rm -rf android
-          flutter create . --platforms=android --org com.memorymaker --project-name memory_maker_admin
-      - name: Patch Android app name and icon
+          flutter create . --platforms=android --org com.memorymaker --project-name memorymaker_admin_app
+
+      - name: Patch Android app name and permissions
         script: |
           python3 - <<'PY'
           from pathlib import Path
-          import shutil
-          manifest = Path('android/app/src/main/AndroidManifest.xml')
+
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
           text = manifest.read_text()
-          text = text.replace('android:label="memory_maker_admin"', 'android:label="Memory Maker Admin"')
-          text = text.replace('android:label="memory_maker_admin"', 'android:label="Memory Maker Admin"')
+
+          permissions = [
+              '<uses-permission android:name="android.permission.INTERNET" />',
+              '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />',
+          ]
+
+          for permission in reversed(permissions):
+              if permission not in text:
+                  text = text.replace(
+                      '<manifest xmlns:android="http://schemas.android.com/apk/res/android">',
+                      '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\\n    ' + permission
+                  )
+
+          text = text.replace('android:label="memorymaker_admin_app"', 'android:label="Memory Maker Admin"')
           manifest.write_text(text)
-          icon = Path('assets/admin_icon.png')
-          for folder in ['mipmap-mdpi','mipmap-hdpi','mipmap-xhdpi','mipmap-xxhdpi','mipmap-xxxhdpi']:
-              dest = Path('android/app/src/main/res') / folder / 'ic_launcher.png'
-              dest.parent.mkdir(parents=True, exist_ok=True)
-              if icon.exists():
-                  shutil.copyfile(icon, dest)
+          print("Android manifest patched")
           PY
+
       - name: Get Flutter packages
         script: |
           flutter clean
           flutter pub get
+
       - name: Build release APK
         script: |
-          flutter build apk --release -t lib/main.dart
+          flutter build apk --release -t lib/main.dart \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+            --dart-define=APP_URL="$APP_URL" \
+            --dart-define=DEMO_MODE="$DEMO_MODE"
+
     artifacts:
       - build/app/outputs/flutter-apk/app-release.apk
+
+    publishing:
+      email:
+        recipients:
+          - billilkov@gmail.com
+        notify:
+          success: true
+          failure: true
