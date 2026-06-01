@@ -1,0 +1,44 @@
+workflows:
+  android-apk:
+    name: Memory Maker Admin Android APK
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      groups:
+        - memorymaker_env
+    scripts:
+      - name: Create environment file
+        script: |
+          cat > .env <<EOF_ENV
+          SUPABASE_URL=${SUPABASE_URL}
+          SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+          APP_URL=${APP_URL}
+          DEMO_MODE=${DEMO_MODE}
+          EOF_ENV
+      - name: Create Android project
+        script: |
+          rm -rf android
+          flutter create . --platforms=android --org com.memorymaker --project-name memory_maker_admin
+      - name: Patch Android app name and permissions
+        script: |
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          text = manifest.read_text()
+          if '<uses-permission android:name="android.permission.INTERNET" />' not in text:
+              text = text.replace('<manifest xmlns:android="http://schemas.android.com/apk/res/android">', '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET" />')
+          text = text.replace('android:label="memory_maker_admin"', 'android:label="Memory Maker Admin"')
+          manifest.write_text(text)
+          PY
+      - name: Get packages
+        script: |
+          flutter clean
+          flutter pub get
+      - name: Generate launcher icon
+        script: |
+          dart run flutter_launcher_icons || true
+      - name: Build release APK
+        script: |
+          flutter build apk --release -t lib/main.dart
+    artifacts:
+      - build/app/outputs/flutter-apk/app-release.apk
