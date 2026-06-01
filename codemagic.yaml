@@ -9,9 +9,9 @@ workflows:
         - memorymaker_env
 
     scripts:
-      - name: Verify Supabase environment variables
+      - name: Verify Supabase env variables
         script: |
-          echo "Checking environment variables..."
+          echo "Checking env..."
 
           if [ -z "$SUPABASE_URL" ]; then
             echo "ERROR: SUPABASE_URL is missing"
@@ -24,12 +24,10 @@ workflows:
           fi
 
           if [ -z "$APP_URL" ]; then
-            echo "APP_URL is missing, setting default"
             export APP_URL="https://memorymaker.com"
           fi
 
           if [ -z "$DEMO_MODE" ]; then
-            echo "DEMO_MODE is missing, setting false"
             export DEMO_MODE="false"
           fi
 
@@ -38,24 +36,48 @@ workflows:
           echo "APP_URL: $APP_URL"
           echo "DEMO_MODE: $DEMO_MODE"
 
-      - name: Create environment file
+      - name: Create .env file
         script: |
-          cat > .env <<EOF2
-          SUPABASE_URL=$SUPABASE_URL
-          SUPABASE_ANON_KEY=$SUPABASE_ANON_KEY
-          APP_URL=$APP_URL
-          DEMO_MODE=$DEMO_MODE
-          EOF2
+          printf "SUPABASE_URL=%s\n" "$SUPABASE_URL" > .env
+          printf "SUPABASE_ANON_KEY=%s\n" "$SUPABASE_ANON_KEY" >> .env
+          printf "APP_URL=%s\n" "$APP_URL" >> .env
+          printf "DEMO_MODE=%s\n" "$DEMO_MODE" >> .env
 
-          echo ".env file created"
+          echo ".env created:"
           cat .env | sed 's/SUPABASE_ANON_KEY=.*/SUPABASE_ANON_KEY=HIDDEN/'
+
+      - name: Force .env into Flutter assets
+        script: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("pubspec.yaml")
+          text = p.read_text()
+
+          if "flutter:" not in text:
+              text += "\nflutter:\n  uses-material-design: true\n  assets:\n    - .env\n    - assets/\n"
+          else:
+              if "uses-material-design:" not in text:
+                  text = text.replace("flutter:\n", "flutter:\n  uses-material-design: true\n", 1)
+
+              if "assets:" not in text:
+                  text = text.replace("flutter:\n", "flutter:\n  assets:\n    - .env\n    - assets/\n", 1)
+              else:
+                  if "- .env" not in text:
+                      text = text.replace("assets:\n", "assets:\n    - .env\n", 1)
+                  if "- assets/" not in text:
+                      text = text.replace("assets:\n", "assets:\n    - assets/\n", 1)
+
+          p.write_text(text)
+          print(p.read_text())
+          PY
 
       - name: Create Android project
         script: |
           rm -rf android
           flutter create . --platforms=android --org com.memorymaker --project-name memorymaker_admin_app
 
-      - name: Patch Android app name and permissions
+      - name: Patch Android app name and internet permission
         script: |
           python3 - <<'PY'
           from pathlib import Path
@@ -65,7 +87,7 @@ workflows:
 
           permissions = [
               '<uses-permission android:name="android.permission.INTERNET" />',
-              '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />',
+              '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />'
           ]
 
           for permission in reversed(permissions):
@@ -80,7 +102,7 @@ workflows:
           print("Android manifest patched")
           PY
 
-      - name: Get Flutter packages
+      - name: Get packages
         script: |
           flutter clean
           flutter pub get
@@ -95,11 +117,3 @@ workflows:
 
     artifacts:
       - build/app/outputs/flutter-apk/app-release.apk
-
-    publishing:
-      email:
-        recipients:
-          - billilkov@gmail.com
-        notify:
-          success: true
-          failure: true
