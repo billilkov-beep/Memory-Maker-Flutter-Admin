@@ -1,33 +1,24 @@
-# Memory Maker Admin App
+# Memory Maker Admin
 
-Admin-only Flutter app for Memory Maker.
+Public beta admin Flutter app for super admins and sub admins.
 
 ## Features
-- Super admin / sub admin login using Supabase Auth
-- Admin access verification via profiles table
+- Secure Supabase login
+- Public release splash screen
+- Super admin and sub admin access check
 - Dashboard overview
-- Support ticket management
-- Reply to tickets and create user notifications
-- User list and admin role view
-- Gallery/event list
-- Media count visibility
-- Modern rose/ivory glass UI
-
-## Environment
-Create `.env` from `.env.example`:
-
-```
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_ANON_KEY=your-anon-key
-APP_URL=https://memorymaker.com
-DEMO_MODE=false
-```
+- Support ticket list and replies
+- User list and role management
+- Gallery list and upload inspection
+- Modern glass UI
 
 ## Build
-```
-flutter pub get
-flutter build apk --release -t lib/main.dart
-```
+Use Codemagic with env group `memorymaker_env`.
 
-## Codemagic
-This package includes codemagic.yaml with no paid linux instance_type.
+Required variables:
+- SUPABASE_URL
+- SUPABASE_ANON_KEY
+- APP_URL
+- DEMO_MODE=false
+
+No paid Linux instance is used in `codemagic.yaml`.
