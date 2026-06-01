@@ -15,28 +15,31 @@ workflows:
           APP_URL=${APP_URL}
           DEMO_MODE=${DEMO_MODE}
           EOF_ENV
-      - name: Create Android project
+      - name: Recreate Android project
         script: |
           rm -rf android
           flutter create . --platforms=android --org com.memorymaker --project-name memory_maker_admin
-      - name: Patch Android app name and permissions
+      - name: Patch Android app name and icon
         script: |
           python3 - <<'PY'
           from pathlib import Path
+          import shutil
           manifest = Path('android/app/src/main/AndroidManifest.xml')
           text = manifest.read_text()
-          if '<uses-permission android:name="android.permission.INTERNET" />' not in text:
-              text = text.replace('<manifest xmlns:android="http://schemas.android.com/apk/res/android">', '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET" />')
+          text = text.replace('android:label="memory_maker_admin"', 'android:label="Memory Maker Admin"')
           text = text.replace('android:label="memory_maker_admin"', 'android:label="Memory Maker Admin"')
           manifest.write_text(text)
+          icon = Path('assets/admin_icon.png')
+          for folder in ['mipmap-mdpi','mipmap-hdpi','mipmap-xhdpi','mipmap-xxhdpi','mipmap-xxxhdpi']:
+              dest = Path('android/app/src/main/res') / folder / 'ic_launcher.png'
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              if icon.exists():
+                  shutil.copyfile(icon, dest)
           PY
-      - name: Get packages
+      - name: Get Flutter packages
         script: |
           flutter clean
           flutter pub get
-      - name: Generate launcher icon
-        script: |
-          dart run flutter_launcher_icons || true
       - name: Build release APK
         script: |
           flutter build apk --release -t lib/main.dart

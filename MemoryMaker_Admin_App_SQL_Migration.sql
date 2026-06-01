@@ -1,14 +1,12 @@
 -- ============================================================
 -- Memory Maker Admin App SQL Migration
--- Adds admin RPC API used by the new Flutter Admin App.
+-- Creates/updates admin RPCs used by the Flutter Admin App.
 -- Safe to run multiple times.
 -- ============================================================
 
 create extension if not exists pgcrypto;
 
--- -----------------------------
--- Required base columns
--- -----------------------------
+-- ---------- base tables ----------
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   full_name text,
@@ -92,6 +90,16 @@ create table if not exists public.event_guests (
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
+
+alter table public.event_guests
+  add column if not exists user_id uuid references auth.users(id) on delete cascade,
+  add column if not exists email text,
+  add column if not exists display_name text,
+  add column if not exists status text default 'invited',
+  add column if not exists invited_at timestamptz,
+  add column if not exists accepted_at timestamptz,
+  add column if not exists created_at timestamptz default now(),
+  add column if not exists updated_at timestamptz default now();
 
 create table if not exists public.media_uploads (
   id uuid primary key default gen_random_uuid(),
@@ -195,9 +203,15 @@ create table if not exists public.user_notifications (
   read_at timestamptz
 );
 
--- -----------------------------
--- Indexes
--- -----------------------------
+alter table public.user_notifications
+  add column if not exists event_id uuid references public.events(id) on delete cascade,
+  add column if not exists title text,
+  add column if not exists body text,
+  add column if not exists status text default 'unread',
+  add column if not exists created_at timestamptz default now(),
+  add column if not exists read_at timestamptz;
+
+-- indexes
 create index if not exists profiles_role_idx on public.profiles(role);
 create index if not exists events_owner_id_idx on public.events(owner_id);
 create index if not exists events_user_id_idx on public.events(user_id);
@@ -206,9 +220,16 @@ create index if not exists support_tickets_user_id_idx on public.support_tickets
 create index if not exists support_tickets_status_idx on public.support_tickets(status);
 create index if not exists user_notifications_user_id_idx on public.user_notifications(user_id);
 
--- -----------------------------
--- Auth profile backfill and trigger
--- -----------------------------
+-- RLS on, app reads through secure RPCs
+alter table public.profiles enable row level security;
+alter table public.events enable row level security;
+alter table public.event_guests enable row level security;
+alter table public.media_uploads enable row level security;
+alter table public.media_blobs enable row level security;
+alter table public.support_tickets enable row level security;
+alter table public.user_notifications enable row level security;
+
+-- profile trigger
 create or replace function public.handle_new_user()
 returns trigger
 language plpgsql
@@ -217,17 +238,8 @@ set search_path = public
 as $$
 begin
   insert into public.profiles (id, full_name, role, is_super_admin, created_at, updated_at)
-  values (
-    new.id,
-    coalesce(new.raw_user_meta_data->>'full_name', split_part(new.email, '@', 1)),
-    'user',
-    false,
-    now(),
-    now()
-  )
-  on conflict (id) do update set
-    full_name = coalesce(public.profiles.full_name, excluded.full_name),
-    updated_at = now();
+  values (new.id, coalesce(new.raw_user_meta_data->>'full_name', split_part(new.email, '@', 1)), 'user', false, now(), now())
+  on conflict (id) do update set full_name = coalesce(public.profiles.full_name, excluded.full_name), updated_at = now();
   return new;
 end;
 $$;
@@ -241,9 +253,7 @@ from auth.users u
 left join public.profiles p on p.id = u.id
 where p.id is null;
 
--- -----------------------------
--- Admin helpers
--- -----------------------------
+-- admin helpers
 create or replace function public.app_is_admin()
 returns boolean
 language sql
@@ -252,16 +262,11 @@ set search_path = public
 stable
 as $$
   select exists (
-    select 1
-    from public.profiles p
+    select 1 from public.profiles p
     where p.id = auth.uid()
-      and (
-        coalesce(p.is_super_admin, false) = true
-        or lower(coalesce(p.role::text, '')) in ('super_admin', 'sub_admin', 'admin')
-      )
+      and (coalesce(p.is_super_admin,false)=true or lower(coalesce(p.role::text,'')) in ('super_admin','sub_admin','admin'))
   );
 $$;
-
 grant execute on function public.app_is_admin() to authenticated;
 
 create or replace function public.app_is_super_admin()
@@ -272,16 +277,11 @@ set search_path = public
 stable
 as $$
   select exists (
-    select 1
-    from public.profiles p
+    select 1 from public.profiles p
     where p.id = auth.uid()
-      and (
-        coalesce(p.is_super_admin, false) = true
-        or lower(coalesce(p.role::text, '')) = 'super_admin'
-      )
+      and (coalesce(p.is_super_admin,false)=true or lower(coalesce(p.role::text,''))='super_admin')
   );
 $$;
-
 grant execute on function public.app_is_super_admin() to authenticated;
 
 create or replace function public.app_admin_me()
@@ -291,12 +291,12 @@ security definer
 set search_path = public
 stable
 as $$
-  select jsonb_build_object(
+  select coalesce(jsonb_build_object(
     'allowed', public.app_is_admin(),
     'id', p.id,
-    'full_name', p.full_name,
     'email', u.email,
-    'role', coalesce(p.role::text, 'user'),
+    'full_name', p.full_name,
+    'role', coalesce(p.role::text,'user'),
     'is_super_admin', coalesce(p.is_super_admin,false),
     'avatar_url', p.avatar_url,
     'avatar_base64', p.avatar_base64,
@@ -304,12 +304,11 @@ as $$
     'profile_photo_url', p.profile_photo_url,
     'image_url', p.image_url,
     'photo_url', p.photo_url
-  )
+  ), jsonb_build_object('allowed', false))
   from public.profiles p
   left join auth.users u on u.id = p.id
   where p.id = auth.uid();
 $$;
-
 grant execute on function public.app_admin_me() to authenticated;
 
 create or replace function public.app_admin_overview()
@@ -318,116 +317,22 @@ language plpgsql
 security definer
 set search_path = public
 as $$
-declare
-  v jsonb;
 begin
   if not public.app_is_admin() then raise exception 'Admin access required'; end if;
-  select jsonb_build_object(
+  return jsonb_build_object(
     'users_count', (select count(*) from auth.users),
     'events_count', (select count(*) from public.events),
     'uploads_count', (select count(*) from public.media_uploads where deleted_at is null),
     'tickets_count', (select count(*) from public.support_tickets),
     'open_tickets_count', (select count(*) from public.support_tickets where lower(coalesce(status::text,'')) in ('open','pending','new')),
     'notifications_count', (select count(*) from public.user_notifications)
-  ) into v;
-  return v;
+  );
 end;
 $$;
-
 grant execute on function public.app_admin_overview() to authenticated;
 
-create or replace function public.app_admin_list_users()
-returns table (
-  id uuid,
-  email text,
-  full_name text,
-  phone text,
-  role text,
-  is_super_admin boolean,
-  avatar_url text,
-  avatar_base64 text,
-  profile_picture_url text,
-  profile_photo_url text,
-  image_url text,
-  photo_url text,
-  created_at timestamptz,
-  last_sign_in_at timestamptz,
-  events_count bigint,
-  uploads_count bigint,
-  tickets_count bigint
-)
-language plpgsql
-security definer
-set search_path = public
-as $$
-begin
-  if not public.app_is_admin() then raise exception 'Admin access required'; end if;
-  return query
-  select
-    u.id,
-    u.email::text,
-    p.full_name,
-    p.phone,
-    coalesce(p.role::text,'user')::text,
-    coalesce(p.is_super_admin,false),
-    p.avatar_url,
-    p.avatar_base64,
-    p.profile_picture_url,
-    p.profile_photo_url,
-    p.image_url,
-    p.photo_url,
-    u.created_at,
-    u.last_sign_in_at,
-    (select count(*) from public.events e where e.owner_id = u.id or e.user_id = u.id)::bigint,
-    (select count(*) from public.media_uploads m where m.uploader_id = u.id or m.user_id = u.id)::bigint,
-    (select count(*) from public.support_tickets t where t.user_id = u.id)::bigint
-  from auth.users u
-  left join public.profiles p on p.id = u.id
-  order by u.created_at desc;
-end;
-$$;
-
-grant execute on function public.app_admin_list_users() to authenticated;
-
-create or replace function public.app_admin_set_user_role(p_user_id uuid, p_role text)
-returns jsonb
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  v_role text := lower(coalesce(nullif(trim(p_role), ''), 'user'));
-begin
-  if not public.app_is_super_admin() then raise exception 'Super admin access required'; end if;
-  if v_role not in ('user','sub_admin','super_admin','admin') then v_role := 'user'; end if;
-
-  insert into public.profiles (id, role, is_super_admin, created_at, updated_at)
-  values (p_user_id, v_role, v_role = 'super_admin', now(), now())
-  on conflict (id) do update set
-    role = excluded.role,
-    is_super_admin = excluded.is_super_admin,
-    updated_at = now();
-
-  return jsonb_build_object('ok', true, 'user_id', p_user_id, 'role', v_role);
-end;
-$$;
-
-grant execute on function public.app_admin_set_user_role(uuid, text) to authenticated;
-
 create or replace function public.app_admin_list_tickets()
-returns table (
-  id uuid,
-  user_id uuid,
-  user_email text,
-  user_name text,
-  subject text,
-  message text,
-  admin_reply text,
-  status text,
-  priority text,
-  created_at timestamptz,
-  updated_at timestamptz
-)
+returns table(id uuid, user_id uuid, user_email text, user_name text, subject text, message text, admin_reply text, status text, priority text, created_at timestamptz, updated_at timestamptz)
 language plpgsql
 security definer
 set search_path = public
@@ -435,25 +340,14 @@ as $$
 begin
   if not public.app_is_admin() then raise exception 'Admin access required'; end if;
   return query
-  select
-    t.id,
-    t.user_id,
-    u.email::text,
-    p.full_name,
-    t.subject,
-    t.message,
-    t.admin_reply,
-    coalesce(t.status::text,'open')::text,
-    coalesce(t.priority::text,'normal')::text,
-    t.created_at,
-    t.updated_at
+  select t.id, t.user_id, u.email::text, p.full_name, t.subject, t.message, t.admin_reply,
+         coalesce(t.status::text,'open')::text, coalesce(t.priority::text,'normal')::text, t.created_at, t.updated_at
   from public.support_tickets t
   left join auth.users u on u.id = t.user_id
   left join public.profiles p on p.id = t.user_id
-  order by t.created_at desc;
+  order by t.created_at desc nulls last;
 end;
 $$;
-
 grant execute on function public.app_admin_list_tickets() to authenticated;
 
 create or replace function public.app_admin_reply_ticket(p_ticket_id uuid, p_reply text)
@@ -462,85 +356,61 @@ language plpgsql
 security definer
 set search_path = public
 as $$
-declare
-  v_user uuid;
-  v_subject text;
+declare v_user uuid;
 begin
   if not public.app_is_admin() then raise exception 'Admin access required'; end if;
-
-  select user_id, subject into v_user, v_subject
-  from public.support_tickets
-  where id = p_ticket_id;
-
+  select user_id into v_user from public.support_tickets where id = p_ticket_id;
   if v_user is null then raise exception 'Ticket not found'; end if;
-
-  update public.support_tickets
-  set admin_reply = coalesce(p_reply,''),
-      updated_at = now()
-  where id = p_ticket_id;
-
-  begin
-    update public.support_tickets
-    set status = 'answered'
-    where id = p_ticket_id;
-  exception when others then
-    null;
-  end;
-
-  begin
-    insert into public.user_notifications (user_id, title, body, status, created_at)
-    values (v_user, 'Support reply received', coalesce(p_reply, 'Your support request has been replied to.'), 'unread', now());
-  exception when others then
-    null;
-  end;
-
+  update public.support_tickets set admin_reply = coalesce(p_reply,''), status = 'answered', updated_at = now() where id = p_ticket_id;
+  insert into public.user_notifications (user_id, title, body, status, created_at)
+  values (v_user, 'Support reply received', coalesce(p_reply,'Your support request has been replied to.'), 'unread', now());
   return jsonb_build_object('ok', true, 'ticket_id', p_ticket_id);
 end;
 $$;
-
 grant execute on function public.app_admin_reply_ticket(uuid, text) to authenticated;
 
-create or replace function public.app_admin_update_ticket_status(p_ticket_id uuid, p_status text)
+create or replace function public.app_admin_list_users()
+returns table(id uuid, email text, full_name text, phone text, role text, is_super_admin boolean, avatar_url text, avatar_base64 text, profile_picture_url text, profile_photo_url text, image_url text, photo_url text, created_at timestamptz, last_sign_in_at timestamptz, events_count bigint, uploads_count bigint, tickets_count bigint)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.app_is_admin() then raise exception 'Admin access required'; end if;
+  return query
+  select u.id, u.email::text, p.full_name, p.phone, coalesce(p.role::text,'user')::text, coalesce(p.is_super_admin,false),
+         p.avatar_url, p.avatar_base64, p.profile_picture_url, p.profile_photo_url, p.image_url, p.photo_url,
+         u.created_at, u.last_sign_in_at,
+         (select count(*) from public.events e where e.owner_id = u.id or e.user_id = u.id)::bigint,
+         (select count(*) from public.media_uploads m where m.uploader_id = u.id or m.user_id = u.id)::bigint,
+         (select count(*) from public.support_tickets t where t.user_id = u.id)::bigint
+  from auth.users u
+  left join public.profiles p on p.id = u.id
+  order by u.created_at desc;
+end;
+$$;
+grant execute on function public.app_admin_list_users() to authenticated;
+
+create or replace function public.app_admin_set_user_role(p_user_id uuid, p_role text)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
+declare v_role text := lower(coalesce(nullif(trim(p_role),''),'user'));
 begin
-  if not public.app_is_admin() then raise exception 'Admin access required'; end if;
-  update public.support_tickets
-  set updated_at = now()
-  where id = p_ticket_id;
-
-  begin
-    update public.support_tickets
-    set status = coalesce(nullif(trim(p_status), ''), 'open')
-    where id = p_ticket_id;
-  exception when others then
-    null;
-  end;
-  return jsonb_build_object('ok', true, 'ticket_id', p_ticket_id);
+  if not public.app_is_super_admin() then raise exception 'Super admin access required'; end if;
+  if v_role not in ('user','sub_admin','super_admin','admin') then v_role := 'user'; end if;
+  insert into public.profiles (id, role, is_super_admin, created_at, updated_at)
+  values (p_user_id, v_role, v_role = 'super_admin', now(), now())
+  on conflict (id) do update set role = excluded.role, is_super_admin = excluded.is_super_admin, updated_at = now();
+  return jsonb_build_object('ok', true, 'user_id', p_user_id, 'role', v_role);
 end;
 $$;
-
-grant execute on function public.app_admin_update_ticket_status(uuid, text) to authenticated;
+grant execute on function public.app_admin_set_user_role(uuid, text) to authenticated;
 
 create or replace function public.app_admin_list_events()
-returns table (
-  id uuid,
-  title text,
-  name text,
-  slug text,
-  event_kind text,
-  event_type text,
-  status text,
-  owner_id uuid,
-  owner_email text,
-  gallery_cover_url text,
-  created_at timestamptz,
-  media_count bigint,
-  guests_count bigint
-)
+returns table(id uuid, title text, name text, slug text, event_kind text, event_type text, status text, owner_id uuid, owner_email text, gallery_cover_url text, created_at timestamptz, media_count bigint, guests_count bigint)
 language plpgsql
 security definer
 set search_path = public
@@ -548,116 +418,31 @@ as $$
 begin
   if not public.app_is_admin() then raise exception 'Admin access required'; end if;
   return query
-  select
-    e.id,
-    coalesce(e.title, e.name, 'Memory Gallery')::text,
-    coalesce(e.name, e.title, 'Memory Gallery')::text,
-    coalesce(e.slug, e.id::text)::text,
-    coalesce(e.event_kind::text, e.event_type::text, 'Event')::text,
-    coalesce(e.event_type::text, e.event_kind::text, 'Event')::text,
-    coalesce(e.status::text, 'active')::text,
-    coalesce(e.owner_id, e.user_id),
-    u.email::text,
-    e.gallery_cover_url,
-    e.created_at,
-    (select count(*) from public.media_uploads m where m.event_id = e.id and m.deleted_at is null)::bigint,
-    (select count(*) from public.event_guests g where g.event_id = e.id)::bigint
+  select e.id, coalesce(e.title,e.name,'Memory Gallery')::text, coalesce(e.name,e.title,'Memory Gallery')::text, coalesce(e.slug,e.id::text)::text,
+         coalesce(e.event_kind::text,e.event_type::text,'Event')::text, coalesce(e.event_type::text,e.event_kind::text,'Event')::text,
+         coalesce(e.status::text,'active')::text, coalesce(e.owner_id,e.user_id), u.email::text, e.gallery_cover_url, e.created_at,
+         (select count(*) from public.media_uploads m where m.event_id = e.id and m.deleted_at is null)::bigint,
+         (select count(*) from public.event_guests g where g.event_id = e.id)::bigint
   from public.events e
-  left join auth.users u on u.id = coalesce(e.owner_id, e.user_id)
+  left join auth.users u on u.id = coalesce(e.owner_id,e.user_id)
   order by e.created_at desc nulls last;
 end;
 $$;
-
 grant execute on function public.app_admin_list_events() to authenticated;
 
-create or replace function public.app_admin_list_media(p_event_id uuid)
-returns table (
-  id uuid,
-  event_id uuid,
-  uploader_id uuid,
-  uploader_email text,
-  original_filename text,
-  status text,
-  caption text,
-  uploaded_at timestamptz,
-  created_at timestamptz,
-  data_url text
-)
-language plpgsql
-security definer
-set search_path = public
-as $$
-begin
-  if not public.app_is_admin() then raise exception 'Admin access required'; end if;
-  return query
-  select
-    m.id,
-    m.event_id,
-    coalesce(m.uploader_id, m.user_id),
-    coalesce(m.uploader_email, u.email)::text,
-    coalesce(m.original_filename, m.object_key, m.storage_key, 'memory.jpg')::text,
-    coalesce(m.status::text, 'approved')::text,
-    m.caption,
-    m.uploaded_at,
-    m.created_at,
-    case when b.compressed_base64 is not null
-      then ('data:' || coalesce(b.compressed_content_type, 'image/jpeg') || ';base64,' || b.compressed_base64)::text
-      else null
-    end
-  from public.media_uploads m
-  left join public.media_blobs b on b.upload_id = m.id
-  left join auth.users u on u.id = coalesce(m.uploader_id, m.user_id)
-  where m.event_id = p_event_id
-    and m.deleted_at is null
-  order by coalesce(m.created_at, m.uploaded_at) desc nulls last;
-end;
-$$;
+-- Make Bill super admin if the Auth user already exists.
+-- Create bill@abp.ca in Supabase Authentication if it does not exist.
+insert into public.profiles (id, full_name, role, is_super_admin, created_at, updated_at)
+select id, 'Bill Admin', 'super_admin', true, now(), now()
+from auth.users
+where lower(email) = lower('bill@abp.ca')
+on conflict (id) do update set full_name = 'Bill Admin', role = 'super_admin', is_super_admin = true, updated_at = now();
 
-grant execute on function public.app_admin_list_media(uuid) to authenticated;
-
-create or replace function public.app_admin_list_notifications()
-returns table (
-  id uuid,
-  user_id uuid,
-  user_email text,
-  title text,
-  body text,
-  status text,
-  created_at timestamptz,
-  read_at timestamptz
-)
-language plpgsql
-security definer
-set search_path = public
-as $$
-begin
-  if not public.app_is_admin() then raise exception 'Admin access required'; end if;
-  return query
-  select n.id, n.user_id, u.email::text, n.title, n.body, coalesce(n.status::text,'unread')::text, n.created_at, n.read_at
-  from public.user_notifications n
-  left join auth.users u on u.id = n.user_id
-  order by n.created_at desc;
-end;
-$$;
-
-grant execute on function public.app_admin_list_notifications() to authenticated;
-
--- RLS remains enabled; admin app uses SECURITY DEFINER RPCs above.
-alter table public.profiles enable row level security;
-alter table public.events enable row level security;
-alter table public.event_guests enable row level security;
-alter table public.media_uploads enable row level security;
-alter table public.media_blobs enable row level security;
-alter table public.support_tickets enable row level security;
-alter table public.user_notifications enable row level security;
-
--- Optional: make this email super admin. Change if needed.
-update public.profiles
-set is_super_admin = true,
-    role = 'super_admin',
-    updated_at = now()
-where id in (
-  select id from auth.users where lower(email) = lower('areebwebzards@gmail.com')
-);
+-- Also keep your existing account as super admin if present.
+insert into public.profiles (id, full_name, role, is_super_admin, created_at, updated_at)
+select id, coalesce(raw_user_meta_data->>'full_name','Admin'), 'super_admin', true, now(), now()
+from auth.users
+where lower(email) = lower('areebwebzards@gmail.com')
+on conflict (id) do update set role = 'super_admin', is_super_admin = true, updated_at = now();
 
 -- DONE
